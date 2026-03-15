@@ -1,16 +1,13 @@
 """
-SteerMOE Technique
-Expert-routing-based steering for Mixture-of-Experts models.
+SteerMOE Technique — EasySteer implementation for gpt-oss.
 
-Instead of adding vectors to hidden states, SteerMOE steers by biasing
-router logits at inference time: boosting "positive" experts and suppressing
-"negative" experts identified from activation pattern differences.
-
-Reference: Adobe SteerMOE (src/utils.py:steer_moe)
+Captures router logits via PyTorch forward hooks on MLPBlock,
+bypassing the vllm-steer RPC capture system which does not recognise
+gpt-oss MLPBlock as a MoE layer.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -24,62 +21,150 @@ logger = logging.getLogger(__name__)
 
 class MoESteeringWeights:
     """
-    Holds per-layer expert steering weights for MoE models.
-
+    Per-layer expert steering weights for MoE models.
     Shape: [num_layers, num_experts]
-      +value  → boost that expert  (router logit pushed to max + 0.01)
-      -value  → suppress that expert (router logit pushed to min - 0.01)
-       0      → leave that expert untouched
+      +value  → boost expert   (router logit set to max + 0.01)
+      -value  → suppress expert (router logit set to min - 0.01)
+       0      → no-op
     """
 
-    def __init__(
-        self,
-        weights: torch.Tensor,          # [num_layers, num_experts]
-        model_type: str = "unknown",
-        metadata: Optional[Dict] = None,
-    ):
+    def __init__(self, weights: torch.Tensor, model_type: str = "unknown",
+                 metadata: Optional[Dict] = None):
         assert weights.ndim == 2, "weights must be [num_layers, num_experts]"
         self.weights = weights
         self.model_type = model_type
         self.metadata = metadata or {}
 
     @property
-    def num_layers(self) -> int:
-        return self.weights.shape[0]
+    def num_layers(self): return self.weights.shape[0]
 
     @property
-    def num_experts(self) -> int:
-        return self.weights.shape[1]
+    def num_experts(self): return self.weights.shape[1]
 
     def save(self, path: str) -> None:
-        """Save to a .pt file."""
-        torch.save(
-            {
-                "weights": self.weights,
-                "model_type": self.model_type,
-                "metadata": self.metadata,
-            },
-            path,
-        )
+        torch.save({"weights": self.weights, "model_type": self.model_type,
+                    "metadata": self.metadata}, path)
         logger.info(f"MoESteeringWeights saved to {path}")
 
     @classmethod
     def load(cls, path: str) -> "MoESteeringWeights":
-        """Load from a .pt file saved by :meth:`save`."""
         data = torch.load(path, map_location="cpu")
-        return cls(
-            weights=data["weights"],
-            model_type=data.get("model_type", "unknown"),
-            metadata=data.get("metadata", {}),
-        )
+        return cls(weights=data["weights"], model_type=data.get("model_type", "unknown"),
+                   metadata=data.get("metadata", {}))
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         nnz = (self.weights != 0).sum().item()
-        return (
-            f"MoESteeringWeights(model={self.model_type}, "
-            f"layers={self.num_layers}, experts={self.num_experts}, "
-            f"nonzero={nnz})"
-        )
+        return (f"MoESteeringWeights(model={self.model_type}, "
+                f"layers={self.num_layers}, experts={self.num_experts}, nonzero={nnz})")
+
+
+# ---------------------------------------------------------------------------
+# One-time setup: inject capture hooks into the worker process
+# ---------------------------------------------------------------------------
+
+def _setup_gpt_oss_capture(llm: Any) -> None:
+    """
+    Inject everything needed for router-logit capture via RPC + forward hooks.
+    Safe to call multiple times (idempotent).
+    """
+    import vllm.v1.worker.gpu_worker as gw_module
+
+    # ── Step 1: patch enable to store runner ref ───────────────────────────
+    if not getattr(gw_module, '_gpt_oss_patched', False):
+        original_enable = gw_module.Worker.enable_moe_router_logits_capture
+
+        def enable_and_store(self):
+            gw_module._RUNNER_REF = self.model_runner
+            return original_enable(self)
+
+        gw_module.Worker.enable_moe_router_logits_capture = enable_and_store
+
+        def setup_gpt_oss_capture(self):
+            from vllm.hidden_states import VLLMTransformerLayerWrapper
+            runner = gw_module._RUNNER_REF
+            if runner is None:
+                return "ERROR: runner not set — call enable first"
+
+            # Remove any existing hooks
+            for h in getattr(runner, '_hook_handles', []):
+                h.remove()
+            runner._hook_handles = []
+
+            store = runner.moe_router_logits_store
+            m = runner.model
+            layers = m.model.layers if hasattr(m, 'model') else m.layers
+
+            hooked = 0
+            for layer_idx, layer in enumerate(layers):
+                real_layer = (layer.base_layer
+                              if isinstance(layer, VLLMTransformerLayerWrapper)
+                              else layer)
+                mlp = real_layer._modules.get('mlp')
+                if mlp is None or not hasattr(mlp, 'router'):
+                    continue
+
+                def make_hook(layer_id, st):
+                    def hook(module, inp, output):
+                        if not st.capture_enabled:
+                            return
+                        try:
+                            x = inp[0]
+                            g = module.router(x)
+                            if isinstance(g, tuple):
+                                g = g[0]
+                            st.store_router_logits(
+                                layer_id, g, f"layer_{layer_id}.mlp")
+                        except Exception:
+                            pass
+                    return hook
+
+                handle = mlp.register_forward_hook(
+                    make_hook(layer_idx, store))
+                runner._hook_handles.append(handle)
+                hooked += 1
+
+            runner._moe_wrapped = True
+            return f"Registered {hooked} forward hooks"
+
+        gw_module.Worker.setup_gpt_oss_capture = setup_gpt_oss_capture
+        gw_module._gpt_oss_patched = True
+
+    def _inject(model):
+        return "ok"
+
+    llm.llm_engine.apply_model(_inject)  # ensure worker process is alive
+
+    # ── Step 2: enable (sets _RUNNER_REF) then setup hooks ────────────────
+    llm.llm_engine.engine_core.collective_rpc(
+        "enable_moe_router_logits_capture")
+    result = llm.llm_engine.engine_core.collective_rpc(
+        "setup_gpt_oss_capture")
+    logger.info(f"gpt-oss capture setup: {result}")
+
+    # ── Step 3: disable capture until we actually want to capture ──────────
+    llm.llm_engine.engine_core.collective_rpc(
+        "disable_moe_router_logits_capture")
+
+
+def _capture_router_logits(llm: Any, texts: List[str]) -> Dict[int, torch.Tensor]:
+    """
+    Run a generate pass over `texts` and return captured router logits.
+    Dict[layer_id -> Tensor(n_tokens, n_experts)]
+    """
+    from vllm import SamplingParams
+    from vllm.hidden_states import deserialize_moe_router_logits
+
+    llm.llm_engine.engine_core.collective_rpc(
+        "enable_moe_router_logits_capture")
+    try:
+        llm.generate(texts, SamplingParams(max_tokens=1, temperature=0.0))
+        results = llm.llm_engine.engine_core.collective_rpc(
+            "get_moe_router_logits")
+        return deserialize_moe_router_logits(results[0])
+    finally:
+        llm.llm_engine.engine_core.collective_rpc("clear_moe_router_logits")
+        llm.llm_engine.engine_core.collective_rpc(
+            "disable_moe_router_logits_capture")
 
 
 # ---------------------------------------------------------------------------
@@ -88,18 +173,8 @@ class MoESteeringWeights:
 
 class SteerMOEExtractor:
     """
-    Extracts MoE steering weights from positive/negative example sets.
-
-    Pipeline
-    --------
-    1. Capture router logits for positive texts  →  per-layer expert activation freq
-    2. Capture router logits for negative texts  →  per-layer expert activation freq
-    3. Compute ``risk_diff = freq_pos - freq_neg`` per (layer, expert)
-    4. Select top-N positive experts and top-N negative experts
-    5. Return :class:`MoESteeringWeights` tensor
-
-    The resulting weights are fed into ``update_moe_manual_args()`` on the
-    vLLM model (see :func:`easysteer.hidden_states.apply_moe_steering_weights`).
+    Extracts MoE steering weights from positive/negative example sets
+    using router logit activation frequency differences.
     """
 
     @staticmethod
@@ -111,121 +186,82 @@ class SteerMOEExtractor:
         num_neg_experts: int = 10,
         top_k: int = 2,
         reverse_effect: bool = False,
-        use_generate: bool = False,
+        use_generate: bool = False,   # kept for API compat, ignored (always generate)
         model_type: str = "unknown",
         **kwargs,
     ) -> MoESteeringWeights:
         """
-        Extract MoE steering weights.
+        Extract SteerMOE weights.
 
         Parameters
         ----------
-        llm:
-            A vLLM ``LLM`` instance (must be a MoE model with router logit
-            capture support).
-        positive_texts:
-            Texts that should activate the desired behaviour.
-        negative_texts:
-            Texts that should activate the opposite/undesired behaviour.
-        num_pos_experts:
-            How many top positive-risk experts to boost.
-        num_neg_experts:
-            How many top negative-risk experts to suppress.
-        top_k:
-            Number of experts selected per token by the router (used when
-            computing per-expert activation frequency).
-        reverse_effect:
-            If True, flip the sign of ``risk_diff`` before selection (i.e.
-            steer in the opposite direction).
-        use_generate:
-            Use ``llm.generate()`` capture instead of ``llm.embed()``.
-            Required for models that don't support the embed task.
-        model_type:
-            String identifier stored in the returned weights object.
-
-        Returns
-        -------
-        MoESteeringWeights
+        llm : vLLM LLM instance (gpt-oss MoE model)
+        positive_texts : texts expressing desired behaviour
+        negative_texts : texts expressing undesired behaviour
+        num_pos_experts : experts to boost
+        num_neg_experts : experts to suppress
+        top_k : router top-k (used for frequency normalisation)
+        reverse_effect : flip steering direction
+        model_type : informational string
         """
-        import easysteer.hidden_states as hs
+        # ── 0. One-time setup ──────────────────────────────────────────────
+        _setup_gpt_oss_capture(llm)
 
-        # ------------------------------------------------------------------
-        # 1. Capture router logits
-        # ------------------------------------------------------------------
         logger.info(
             f"SteerMOE: capturing router logits for "
             f"{len(positive_texts)} positive / {len(negative_texts)} negative texts"
         )
 
-        if use_generate:
-            pos_logits, _ = hs.get_moe_router_logits_generate(
-                llm, positive_texts, split_by_samples=False
-            )
-            neg_logits, _ = hs.get_moe_router_logits_generate(
-                llm, negative_texts, split_by_samples=False
-            )
-        else:
-            pos_logits, _ = hs.get_moe_router_logits(
-                llm, positive_texts, split_by_samples=False
-            )
-            neg_logits, _ = hs.get_moe_router_logits(
-                llm, negative_texts, split_by_samples=False
-            )
+        # ── 1. Capture router logits ───────────────────────────────────────
+        logger.info("Capturing positive texts...")
+        pos_logits = _capture_router_logits(llm, positive_texts)
 
-        # pos_logits / neg_logits: Dict[layer_id, Tensor(n_tokens, n_experts)]
+        logger.info("Capturing negative texts...")
+        neg_logits = _capture_router_logits(llm, negative_texts)
+
+        if not pos_logits:
+            raise ValueError(
+                "No router logits captured for positive texts. "
+                "Run _setup_gpt_oss_capture(llm) manually and check for errors."
+            )
+        if not neg_logits:
+            raise ValueError("No router logits captured for negative texts.")
 
         layer_ids = sorted(pos_logits.keys())
-        if not layer_ids:
-            raise ValueError("No router logits captured. Is the model a MoE model?")
-
         n_layers = max(layer_ids) + 1
         n_experts = pos_logits[layer_ids[0]].shape[-1]
 
         logger.info(
-            f"SteerMOE: captured {len(layer_ids)} MoE layers, "
-            f"{n_experts} experts each"
-        )
+            f"Captured {len(layer_ids)} layers, {n_experts} experts each")
 
-        # ------------------------------------------------------------------
-        # 2. Compute per-layer per-expert activation frequency
-        # ------------------------------------------------------------------
-        def expert_freq(logits_dict: Dict[int, torch.Tensor]) -> np.ndarray:
-            """freq[layer, expert] = fraction of tokens that activated that expert."""
+        # ── 2. Compute per-layer per-expert activation frequency ───────────
+        def expert_freq(logits_dict):
             freq = np.zeros((n_layers, n_experts), dtype=np.float32)
             for layer_id, logits in logits_dict.items():
-                # logits: (n_tokens, n_experts)
                 probs = torch.softmax(logits.float(), dim=-1)
-                _, topk_ids = torch.topk(probs, k=top_k, dim=-1)
+                _, topk_ids = torch.topk(probs, k=min(top_k, probs.shape[-1]),
+                                         dim=-1)
                 n_tokens = logits.shape[0]
                 counts = torch.bincount(
-                    topk_ids.flatten(), minlength=n_experts
-                ).float()
-                freq[layer_id] = (counts / (n_tokens * top_k)).cpu().numpy()
+                    topk_ids.flatten(), minlength=n_experts).float()
+                freq[layer_id] = (counts / max(n_tokens * top_k, 1)).cpu().numpy()
             return freq
 
         pos_freq = expert_freq(pos_logits)
         neg_freq = expert_freq(neg_logits)
 
-        # ------------------------------------------------------------------
-        # 3. risk_diff = freq_pos - freq_neg
-        # ------------------------------------------------------------------
-        risk_diff = pos_freq - neg_freq          # [n_layers, n_experts]
+        # ── 3. risk_diff ───────────────────────────────────────────────────
+        risk_diff = pos_freq - neg_freq
         risk_diff_abs = np.abs(risk_diff)
-
         if reverse_effect:
             risk_diff = -risk_diff
 
-        # ------------------------------------------------------------------
-        # 4. Select top experts
-        # ------------------------------------------------------------------
-        # Flatten to (layer, expert) pairs sorted by |risk_diff|
+        # ── 4. Select top experts ──────────────────────────────────────────
         flat_abs = risk_diff_abs.flatten()
         flat_diff = risk_diff.flatten()
+        sorted_idx = np.argsort(flat_abs)[::-1]
 
-        sorted_idx = np.argsort(flat_abs)[::-1]  # descending
-
-        pos_selected = 0
-        neg_selected = 0
+        pos_selected = neg_selected = 0
         weights_np = np.zeros((n_layers, n_experts), dtype=np.float32)
 
         for idx in sorted_idx:
@@ -234,7 +270,6 @@ class SteerMOEExtractor:
             layer = int(idx // n_experts)
             expert = int(idx % n_experts)
             diff = float(flat_diff[idx])
-
             if diff > 0 and pos_selected < num_pos_experts:
                 weights_np[layer, expert] = diff
                 pos_selected += 1
@@ -243,21 +278,7 @@ class SteerMOEExtractor:
                 neg_selected += 1
 
         logger.info(
-            f"SteerMOE: selected {pos_selected} positive experts "
-            f"and {neg_selected} negative experts"
-        )
-
-        if pos_selected < num_pos_experts or neg_selected < num_neg_experts:
-            logger.warning(
-                f"SteerMOE: could only find {pos_selected}/{num_pos_experts} "
-                f"positive and {neg_selected}/{num_neg_experts} negative experts. "
-                f"Consider using more texts or reducing num_*_experts."
-            )
-
-        # ------------------------------------------------------------------
-        # 5. Build and return
-        # ------------------------------------------------------------------
-        weights_tensor = torch.from_numpy(weights_np)
+            f"Selected {pos_selected} positive, {neg_selected} negative experts")
 
         metadata = {
             "num_pos_experts": num_pos_experts,
@@ -271,7 +292,7 @@ class SteerMOEExtractor:
         }
 
         return MoESteeringWeights(
-            weights=weights_tensor,
+            weights=torch.from_numpy(weights_np),
             model_type=model_type,
             metadata=metadata,
         )
